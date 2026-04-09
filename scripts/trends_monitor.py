@@ -1,253 +1,409 @@
 #!/usr/bin/env python3
 """
-Google Trends 监控 v4 - 稳定版
-使用 Google Trends RSS feed + 联想词 API
+Google Trends 词根监控 v4
+通过 cookie + curl 方式稳定获取 Google Trends 完整数据
 
 功能:
-- 获取每日热门趋势 (RSS feed, 稳定)
-- 获取关键词联想词 (API, 稳定)
-- 支持多地域 (US, GB, JP, CN, etc)
-- 输出 JSON 或格式化报告
+- 关键词时间序列热度 (interest over time)
+- 崛起相关查询 (rising queries) — 最有 SEO 价值
+- 热门相关查询 (top queries)
+- 地域热度分布 (interest by region)
+- 关键词联想词 (suggestions)
+- 每日热搜 (trending RSS)
 
 用法:
-  python3 trends_monitor.py trending [--geo US]    # 今日热门
-  python3 trends_monitor.py suggest "keyword"     # 联想词
-  python3 trends_monitor.py full "keyword"        # 完整分析（联想词+热门）
+  python3 trends_monitor.py monitor "AI"                    # 完整趋势分析
+  python3 trends_monitor.py monitor "AI" --geo US           # 限定地域
+  python3 trends_monitor.py monitor "AI,ChatGPT,Claude"     # 多词对比(逗号分隔,最多5个)
+  python3 trends_monitor.py monitor "AI" --timeframe "today 12-m"  # 近12个月
+  python3 trends_monitor.py trending --geo US               # 今日热搜
+  python3 trends_monitor.py suggest "AI"                    # 联想词
 """
 
 import json
 import sys
 import argparse
-import random
-import xml.etree.ElementTree as ET
-import urllib.request
-import urllib.parse
 import re
+import subprocess
+import urllib.parse
+import xml.etree.ElementTree as ET
+import time
+import random
+import os
 from datetime import datetime
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
-]
-
-NS = {"ht": "https://trends.google.com/trending/rss"}
+COOKIE_FILE = "/tmp/gt_cookies.txt"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+REFERER_BASE = "https://trends.google.com/trends/explore"
 
 
-def fetch_url(url, retries=2):
-    """URL 请求."""
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                return resp.read().decode("utf-8")
-        except Exception as e:
-            if attempt < retries - 1:
-                continue
-            print(f"[ERROR] {e}", file=sys.stderr)
-    return None
-
-
-def get_trending_rss(geo="US"):
-    """获取每日热门趋势 (RSS)."""
-    url = f"https://trends.google.com/trending/rss?geo={geo}"
-    content = fetch_url(url)
-    if not content:
-        return []
-    
+def curl_get(url, referer=None):
+    """Use curl with cookies to fetch Google Trends API."""
+    ref = referer or REFERER_BASE
+    cmd = [
+        "curl", "-s", "-b", COOKIE_FILE,
+        "-H", f"User-Agent: {UA}",
+        "-H", f"Referer: {ref}",
+        url
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    content = re.sub(r"^\)\]\}',?\n?", "", r.stdout)
+    if not content.strip():
+        return None
     try:
-        root = ET.fromstring(content)
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return None
+
+
+def refresh_cookies():
+    """Refresh Google Trends cookies."""
+    subprocess.run(
+        ["curl", "-s", "-c", COOKIE_FILE, "-o", "/dev/null",
+         "-H", f"User-Agent: {UA}",
+         "https://trends.google.com/trends/?geo=US"],
+        capture_output=True, timeout=15
+    )
+    time.sleep(random.uniform(1, 2))
+
+
+def get_explore_widgets(keywords, timeframe="today 3-m", geo=""):
+    """Get widget tokens from explore endpoint."""
+    comparison = [
+        {"keyword": kw.strip(), "geo": geo, "time": timeframe}
+        for kw in keywords[:5]
+    ]
+    req_data = json.dumps({
+        "comparisonItem": comparison,
+        "category": 0,
+        "property": ""
+    })
+    url = f"https://trends.google.com/trends/api/explore?hl=en-US&tz=-480&req={urllib.parse.quote(req_data)}"
+    referer = f"{REFERER_BASE}?q={urllib.parse.quote(','.join(keywords))}"
+    data = curl_get(url, referer)
+    if not data:
+        return {}
+    return {w["id"]: w for w in data.get("widgets", [])}
+
+
+def fetch_timeseries(widget, keywords):
+    """Fetch interest over time data."""
+    if not widget:
+        return {}, {}
+    token = widget["token"]
+    req = json.dumps(widget["request"])
+    url = f"https://trends.google.com/trends/api/widgetdata/multiline?hl=en-US&tz=-480&req={urllib.parse.quote(req)}&token={token}"
+    data = curl_get(url)
+    if not data:
+        return {}, {}
+
+    timeline = data.get("default", {}).get("timelineData", [])
+    time_data = {}
+    trend_dirs = {}
+
+    for ki, kw in enumerate(keywords):
+        values = []
+        ts = {}
+        for point in timeline:
+            vals = point.get("value", [])
+            if ki < len(vals):
+                ts[point.get("formattedTime", "")] = vals[ki]
+                values.append(vals[ki])
+        time_data[kw] = ts
+
+        if len(values) >= 4:
+            split = max(1, len(values) * 3 // 4)
+            avg_e = sum(values[:split]) / len(values[:split])
+            avg_r = sum(values[split:]) / len(values[split:])
+            change = ((avg_r - avg_e) / avg_e * 100) if avg_e else (100 if avg_r > 0 else 0)
+            if change > 30:
+                direction = "rising"
+            elif change < -30:
+                direction = "declining"
+            else:
+                direction = "stable"
+            trend_dirs[kw] = {
+                "direction": direction,
+                "change_pct": round(change, 1),
+                "current": values[-1],
+                "peak": max(values),
+                "trough": min(values),
+                "avg_earlier": round(avg_e, 1),
+                "avg_recent": round(avg_r, 1),
+            }
+
+    return time_data, trend_dirs
+
+
+def fetch_related_queries(widget):
+    """Fetch related queries (top + rising)."""
+    if not widget:
+        return {}
+    token = widget["token"]
+    req = json.dumps(widget["request"])
+    url = f"https://trends.google.com/trends/api/widgetdata/relatedsearches?hl=en-US&tz=-480&req={urllib.parse.quote(req)}&token={token}"
+    data = curl_get(url)
+    if not data:
+        return {}
+
+    result = {}
+    ranked = data.get("default", {}).get("rankedList", [])
+    for i, rlist in enumerate(ranked):
+        label = "top" if i == 0 else "rising"
         items = []
-        for item in root.findall(".//item"):
-            title = item.findtext("title", "")
-            traffic = item.findtext("ht:approx_traffic", "", NS)
-            pub_date = item.findtext("pubDate", "")
-            picture = item.findtext("ht:picture", "", NS)
-            
-            news_items = []
-            for news in item.findall("ht:news_item", NS):
-                news_items.append({
-                    "title": news.findtext("ht:news_item_title", "", NS),
-                    "url": news.findtext("ht:news_item_url", "", NS),
-                    "source": news.findtext("ht:news_item_source", "", NS),
-                })
-            
+        for kw in rlist.get("rankedKeyword", [])[:15]:
             items.append({
-                "title": title,
-                "traffic": traffic,
-                "pubDate": pub_date,
-                "picture": picture,
-                "news": news_items[:3],
+                "query": kw.get("query", ""),
+                "value": kw.get("formattedValue", str(kw.get("value", 0))),
             })
-        return items
-    except Exception as e:
-        print(f"[ERROR] parse RSS: {e}", file=sys.stderr)
+        result[label] = items
+    return result
+
+
+def fetch_geo_data(widget):
+    """Fetch interest by region."""
+    if not widget:
         return []
+    token = widget["token"]
+    req = json.dumps(widget["request"])
+    url = f"https://trends.google.com/trends/api/widgetdata/comparedgeo?hl=en-US&tz=-480&req={urllib.parse.quote(req)}&token={token}"
+    data = curl_get(url)
+    if not data:
+        return []
+
+    geo_list = data.get("default", {}).get("geoMapData", [])
+    # Filter out zero values
+    results = []
+    for g in geo_list:
+        val = g.get("value", [0])[0]
+        if val > 0:
+            results.append({"region": g.get("geoName", ""), "value": val})
+    return sorted(results, key=lambda x: x["value"], reverse=True)[:15]
 
 
 def get_suggestions(keyword):
-    """获取 Google Trends 联想词."""
+    """Get keyword suggestions from autocomplete API."""
     url = f"https://trends.google.com/trends/api/autocomplete/{urllib.parse.quote(keyword)}?hl=en-US"
-    content = fetch_url(url)
-    if not content:
-        return []
-    
-    content = re.sub(r"^\)\]\}',?\n?", "", content)
+    headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
     try:
+        req = urllib.request.Request(url, headers=headers)
+        import urllib.request
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            content = resp.read().decode("utf-8")
+        content = re.sub(r"^\)\]\}',?\n?", "", content)
         data = json.loads(content)
-        topics = data.get("default", {}).get("topics", [])
         return [
-            {
-                "title": t.get("title", ""),
-                "type": t.get("type", ""),
-                "mid": t.get("mid", ""),
-            }
-            for t in topics[:15]
+            {"title": t.get("title", ""), "type": t.get("type", "")}
+            for t in data.get("default", {}).get("topics", [])[:10]
         ]
-    except Exception as e:
-        print(f"[ERROR] parse suggestions: {e}", file=sys.stderr)
+    except:
         return []
+
+
+def get_trending_rss(geo="US"):
+    """Get daily trending searches via RSS."""
+    url = f"https://trends.google.com/trending/rss?geo={geo}"
+    try:
+        cmd = ["curl", "-s", "-H", f"User-Agent: {UA}", url]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        ns = {"ht": "https://trends.google.com/trending/rss"}
+        root = ET.fromstring(r.stdout)
+        items = []
+        for item in root.findall(".//item"):
+            title = item.findtext("title", "")
+            traffic = item.findtext("ht:approx_traffic", "", ns)
+            news = []
+            for n in item.findall("ht:news_item", ns):
+                news.append({
+                    "title": n.findtext("ht:news_item_title", "", ns),
+                    "source": n.findtext("ht:news_item_source", "", ns),
+                })
+            items.append({"title": title, "traffic": traffic, "news": news[:2]})
+        return items
+    except:
+        return []
+
+
+# === REPORT FORMATTERS ===
+
+def format_monitor_report(keywords, time_data, trend_dirs, related_queries, geo_data, suggestions):
+    """Format full monitoring report."""
+    lines = [
+        f"## 📊 Google Trends 监控报告: {', '.join(keywords)}",
+        f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+    ]
+
+    # Trend direction
+    for kw, info in trend_dirs.items():
+        d = info["direction"]
+        pct = info["change_pct"]
+        emoji_map = {"rising": "🔥" if pct > 50 else "📈", "declining": "📉", "stable": "➡️"}
+        label_map = {"rising": "上升", "declining": "下降", "stable": "平稳"}
+        lines.append(f"### {emoji_map.get(d, '❓')} {kw}: {label_map.get(d, '?')} ({pct:+.1f}%)")
+        lines.append(f"- 当前热度: **{info['current']}**/100 | 峰值: {info['peak']} | 谷值: {info['trough']}")
+        lines.append("")
+
+        # Recent week
+        ts = time_data.get(kw, {})
+        if ts:
+            recent_items = list(ts.items())[-7:]
+            lines.append("**近7天:**")
+            for date, val in recent_items:
+                bar = "█" * (val // 5)
+                lines.append(f"  {date}: {val} {bar}")
+            lines.append("")
+
+    # Rising queries (most valuable for SEO)
+    if related_queries.get("rising"):
+        lines.append("### 🚀 崛起相关查询 (Rising)")
+        for q in related_queries["rising"]:
+            val = q["value"]
+            if "Breakout" in str(val):
+                lines.append(f"- 🔥 **{q['query']}** — Breakout!")
+            else:
+                lines.append(f"- **{q['query']}** — {val}")
+        lines.append("")
+
+    # Top queries
+    if related_queries.get("top"):
+        lines.append("### 🔝 热门相关查询 (Top)")
+        for q in related_queries["top"]:
+            lines.append(f"- {q['query']} — {q['value']}")
+        lines.append("")
+
+    # Geo distribution
+    if geo_data:
+        lines.append("### 🌍 热度地域分布 (Top 10)")
+        for g in geo_data[:10]:
+            bar = "█" * (g["value"] // 5)
+            lines.append(f"- {g['region']}: {g['value']} {bar}")
+        lines.append("")
+
+    # Suggestions
+    if suggestions:
+        lines.append("### 💡 联想词")
+        for s in suggestions:
+            stype = f" ({s['type']})" if s["type"] else ""
+            lines.append(f"- {s['title']}{stype}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def format_trending_report(items, geo):
-    """格式化热门趋势报告."""
+    """Format trending report."""
     lines = [
         f"## 🔥 Google 今日热搜 ({geo})",
         f"更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         "",
     ]
-    
     for i, item in enumerate(items[:20], 1):
-        traffic = item["traffic"]
-        title = item["title"]
-        lines.append(f"**{i}. {title}** — {traffic} 搜索量")
-        
-        if item.get("news"):
-            for news in item["news"][:2]:
-                source = news.get("source", "")
-                news_title = news.get("title", "")[:60]
-                if source:
-                    lines.append(f"   - {news_title} ({source})")
+        lines.append(f"**{i}. {item['title']}** — {item['traffic']} 搜索量")
+        for n in item.get("news", []):
+            lines.append(f"   - {n['title'][:60]} ({n['source']})")
         lines.append("")
-    
     return "\n".join(lines)
 
 
-def format_suggest_report(keyword, suggestions):
-    """格式化联想词报告."""
-    lines = [
-        f"## 💡 关键词分析: {keyword}",
-        f"更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        "",
-        "### 相关联想词",
-    ]
-    
-    for s in suggestions:
-        title = s["title"]
-        stype = s["type"]
-        if stype:
-            lines.append(f"- **{title}** ({stype})")
-        else:
-            lines.append(f"- {title}")
-    
-    if not suggestions:
-        lines.append("- (无联想词)")
-    
-    return "\n".join(lines)
+# === COMMANDS ===
+
+def cmd_monitor(args):
+    """Full keyword monitoring."""
+    keywords = [k.strip() for k in args.keyword.split(",")][:5]
+
+    refresh_cookies()
+
+    widgets = get_explore_widgets(keywords, args.timeframe, args.geo)
+    if not widgets:
+        print("ERROR: Failed to get explore data. Google may be rate-limiting.", file=sys.stderr)
+        sys.exit(1)
+
+    time.sleep(random.uniform(1.5, 2.5))
+    time_data, trend_dirs = fetch_timeseries(widgets.get("TIMESERIES"), keywords)
+
+    time.sleep(random.uniform(1.5, 2.5))
+    related_queries = fetch_related_queries(widgets.get("RELATED_QUERIES"))
+
+    time.sleep(random.uniform(1.5, 2.5))
+    geo_data = fetch_geo_data(widgets.get("GEO_MAP"))
+
+    suggestions = get_suggestions(keywords[0])
+
+    if args.format == "json":
+        result = {
+            "keywords": keywords,
+            "timeframe": args.timeframe,
+            "geo": args.geo or "global",
+            "timestamp": datetime.now().isoformat(),
+            "trend_direction": trend_dirs,
+            "interest_over_time": time_data,
+            "related_queries": related_queries,
+            "interest_by_region": geo_data,
+            "suggestions": suggestions,
+        }
+        output = json.dumps(result, ensure_ascii=False, indent=2)
+    else:
+        output = format_monitor_report(keywords, time_data, trend_dirs, related_queries, geo_data, suggestions)
+
+    if args.output == "-":
+        print(output)
+    else:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(output)
+        print(f"[OK] Saved to {args.output}", file=sys.stderr)
 
 
 def cmd_trending(args):
-    """今日热门命令."""
+    """Daily trending searches."""
     items = get_trending_rss(args.geo)
-    
     if args.format == "json":
-        result = {
-            "geo": args.geo,
-            "timestamp": datetime.now().isoformat(),
-            "items": items,
-        }
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(json.dumps({"geo": args.geo, "timestamp": datetime.now().isoformat(), "items": items}, ensure_ascii=False, indent=2))
     else:
         print(format_trending_report(items, args.geo))
 
 
 def cmd_suggest(args):
-    """联想词命令."""
+    """Keyword suggestions."""
     suggestions = get_suggestions(args.keyword)
-    
     if args.format == "json":
-        result = {
-            "keyword": args.keyword,
-            "timestamp": datetime.now().isoformat(),
-            "suggestions": suggestions,
-        }
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(json.dumps({"keyword": args.keyword, "suggestions": suggestions}, ensure_ascii=False, indent=2))
     else:
-        print(format_suggest_report(args.keyword, suggestions))
-
-
-def cmd_full(args):
-    """完整分析命令."""
-    suggestions = get_suggestions(args.keyword)
-    trending = get_trending_rss(args.geo)
-    
-    if args.format == "json":
-        result = {
-            "keyword": args.keyword,
-            "geo": args.geo,
-            "timestamp": datetime.now().isoformat(),
-            "suggestions": suggestions,
-            "trending": trending[:10],
-        }
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-    else:
-        lines = []
-        lines.append(format_suggest_report(args.keyword, suggestions))
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-        lines.append(format_trending_report(trending[:10], args.geo))
-        print("\n".join(lines))
+        print(f"## 💡 关键词联想: {args.keyword}\n")
+        for s in suggestions:
+            stype = f" ({s['type']})" if s["type"] else ""
+            print(f"- {s['title']}{stype}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Google Trends 监控 v4")
+    parser = argparse.ArgumentParser(description="Google Trends Monitor v4")
     parser.add_argument("--format", choices=["json", "report"], default="report")
-    parser.add_argument("--geo", default="US", help="地域 (US, GB, JP, CN, etc)")
-    
-    subparsers = parser.add_subparsers(dest="command", help="命令")
-    
-    # trending 子命令
-    p_trending = subparsers.add_parser("trending", help="今日热门趋势")
-    p_trending.set_defaults(func=cmd_trending)
-    
-    # suggest 子命令
-    p_suggest = subparsers.add_parser("suggest", help="关键词联想")
-    p_suggest.add_argument("keyword", help="关键词")
-    p_suggest.set_defaults(func=cmd_suggest)
-    
-    # full 子命令
-    p_full = subparsers.add_parser("full", help="完整分析")
-    p_full.add_argument("keyword", help="关键词")
-    p_full.set_defaults(func=cmd_full)
-    
+    parser.add_argument("--geo", default="", help="Region code (US, CN, JP, etc)")
+    parser.add_argument("--output", default="-", help="Output file (default: stdout)")
+
+    sub = parser.add_subparsers(dest="command")
+
+    p_monitor = sub.add_parser("monitor", help="Full keyword trend analysis")
+    p_monitor.add_argument("keyword", help="Keyword(s), comma-separated for comparison")
+    p_monitor.add_argument("--timeframe", default="today 3-m",
+                           help="Time range: now 1-H, now 4-H, now 1-d, now 7-d, today 1-m, today 3-m, today 12-m, today 5-y")
+
+    p_trending = sub.add_parser("trending", help="Daily trending searches")
+
+    p_suggest = sub.add_parser("suggest", help="Keyword suggestions")
+    p_suggest.add_argument("keyword", help="Keyword to get suggestions for")
+
     args = parser.parse_args()
-    
     if not args.command:
         parser.print_help()
         return
-    
-    # 继承全局参数
-    if not hasattr(args, "geo"):
-        args.geo = "US"
-    if not hasattr(args, "format"):
-        args.format = "report"
-    
-    args.func(args)
+
+    if args.command == "monitor":
+        cmd_monitor(args)
+    elif args.command == "trending":
+        cmd_trending(args)
+    elif args.command == "suggest":
+        cmd_suggest(args)
 
 
 if __name__ == "__main__":

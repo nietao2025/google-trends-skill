@@ -2,42 +2,46 @@
 
 Google Trends monitoring skill for [OpenClaw](https://github.com/openclaw/openclaw).
 
-Track trending searches, keyword suggestions, and SEO insights using Google Trends data.
+Full Google Trends data: time series, rising queries, geo distribution, keyword suggestions, and daily trending — with zero external dependencies.
 
 ## Features
 
-- 🔥 **Daily Trending** — Top search topics from Google Trends RSS
-- 💡 **Keyword Suggestions** — Related keywords and topics
-- 🌍 **Multi-region** — Support for US, CN, JP, GB, and more
-- 📊 **Report & JSON output** — Human-readable or machine-parseable
+- 📊 **Time Series** — Interest over time with trend direction analysis
+- 🚀 **Rising Queries** — Keywords with biggest growth (Breakout detection)
+- 🔝 **Top Queries** — Most popular related searches
+- 🌍 **Geo Distribution** — Interest by country/region
+- 💡 **Suggestions** — Google autocomplete topics
+- 🔥 **Daily Trending** — Today's top searches via RSS
+- 🔄 **Multi-keyword Compare** — Compare up to 5 keywords side-by-side
 
 ## Install
 
 ```bash
-# Via ClawHub (if published)
-clawhub install google-trends
-
-# Or manually: copy this repo into your skills directory
+# Clone into your OpenClaw skills directory
 git clone https://github.com/nietao2025/google-trends-skill.git ~/.openclaw/workspace/skills/google-trends
 ```
 
 ## Usage
 
 ```bash
-# Today's trending topics
+# Full keyword analysis
+python3 scripts/trends_monitor.py monitor "AI"
+
+# Compare keywords
+python3 scripts/trends_monitor.py monitor "ChatGPT,Claude,Gemini" --geo US
+
+# JSON output
+python3 scripts/trends_monitor.py monitor "AI" --format json
+
+# Daily trending
 python3 scripts/trends_monitor.py trending --geo US
-
-# Keyword suggestions
-python3 scripts/trends_monitor.py suggest "AI image generator"
-
-# Full analysis
-python3 scripts/trends_monitor.py full "svg converter" --geo US --format report
 ```
 
 ## Requirements
 
 - Python 3.8+
-- No external dependencies (uses only stdlib)
+- `curl`
+- No pip dependencies
 
 ## License
 
