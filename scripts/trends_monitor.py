@@ -186,9 +186,9 @@ def get_suggestions(keyword):
     url = f"https://trends.google.com/trends/api/autocomplete/{urllib.parse.quote(keyword)}?hl=en-US"
     headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
     try:
-        req = urllib.request.Request(url, headers=headers)
-        import urllib.request
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        import urllib.request as urlreq
+        req = urlreq.Request(url, headers=headers)
+        with urlreq.urlopen(req, timeout=15) as resp:
             content = resp.read().decode("utf-8")
         content = re.sub(r"^\)\]\}',?\n?", "", content)
         data = json.loads(content)
